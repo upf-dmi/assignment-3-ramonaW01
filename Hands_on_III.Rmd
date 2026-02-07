@@ -28,6 +28,122 @@ How well does the Random Forest model separate non-Severe from Severe patients b
 
 ```{r}
 
+# --- STEP 1: LIBRARIES ---
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(httr)
+library(tidymodels)
+library(ranger)
+library(vip)
+
+# --- STEP 2: DOWNLOAD DATA ---
+
+# 1. Download Table 3 (Training Proteomics)
+mmc3_url <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc3.xlsx"
+mmc3_file <- tempfile(fileext = ".xlsx")
+GET(mmc3_url, write_disk(mmc3_file, overwrite = TRUE))
+
+df_mmc3_raw <- read_excel(mmc3_file, sheet = 2, skip = 1, na = c("", "NA", "/"))
+
+# 2. Download Metadata (Labels)
+meta_url <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc1.xlsx"
+meta_file <- tempfile(fileext = ".xlsx")
+GET(meta_url, write_disk(meta_file, overwrite = TRUE))
+
+df_metadata_raw <- read_excel(meta_file, sheet = 2, na = c("", "NA", "/"))
+
+# --- STEP 3: CLEANING & FIXING THE IDs ---
+
+# A. Clean Table 3
+df_mmc3 <- df_mmc3_raw %>%
+  clean_names() %>%
+  rename(protein = 1) %>% 
+  select(-2) # Gene Symbol entfernen
+
+# Transponieren
+df_mmc3_transposed <- df_mmc3 %>%
+  column_to_rownames(var = "protein") %>%
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Patient_ID") %>%
+  # --- FIX: IDs GROSS SCHREIBEN ---
+  mutate(Patient_ID = toupper(Patient_ID)) 
+
+# B. Clean Metadata
+df_labels <- df_metadata_raw %>%
+  clean_names() %>%
+  mutate(
+    group = case_when(
+      group_d == 0 ~ "Non-COVID-19",
+      group_d == 1 ~ "Healthy",
+      group_d == 2 ~ "Non-severe",
+      group_d == 3 ~ "Severe",
+      TRUE ~ NA_character_
+    ),
+    group = factor(group, levels = c("Healthy", "Non-COVID-19", "Non-severe", "Severe")),
+    # --- FIX: IDs GROSS SCHREIBEN & LEERZEICHEN WEG ---
+    patient_id_a = toupper(str_trim(patient_id_a))
+  ) %>% 
+  select(patient_id_a, group)
+
+# --- STEP 4: MERGE (Training Data vorbereiten) ---
+
+# Jetzt sollte der Join klappen, da beide IDs "XG1" heißen
+ml_data <- df_mmc3_transposed %>%
+  inner_join(df_labels, by = c("Patient_ID" = "patient_id_a")) %>%
+  filter(group %in% c("Severe", "Non-severe")) %>%
+  mutate(group = droplevels(group)) %>%
+  select(-Patient_ID)
+
+print("--- Data Check (MUSS > 0 sein!) ---")
+print(table(ml_data$group))
+# Erwartet: ca. 26 Severe, 39 Non-severe
+
+# --- STEP 5: MACHINE LEARNING (Exercise 1) ---
+
+set.seed(123)
+
+# 1. Split (Wir teilen Table 3 nochmal intern zum Validieren)
+data_split <- initial_split(ml_data, prop = 0.70, strata = group)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# 2. Recipe
+rf_recipe <- recipe(group ~ ., data = train_data) %>%
+  step_filter_missing(all_predictors(), threshold = 0.4) %>% 
+  step_impute_knn(all_numeric_predictors(), neighbors = 5) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# 3. Model
+rf_spec <- rand_forest(trees = 500) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# 4. Workflow
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_spec)
+
+# 5. Training & Evaluation
+print("Starting Random Forest Training...")
+final_res <- last_fit(rf_workflow, data_split)
+
+# --- RESULTS ---
+
+print("--- Accuracy & AUC ---")
+print(collect_metrics(final_res))
+
+print("--- Confusion Matrix ---")
+preds <- collect_predictions(final_res)
+print(conf_mat(preds, truth = group, estimate = .pred_class))
+
+print("--- ROC Curve ---")
+roc_curve(preds, truth = group, .pred_Severe) %>% 
+  autoplot() + 
+  ggtitle("ROC Curve: Training Cohort (Internal Validation)") +
+  theme_minimal() 
 ```
 
 # Exercise 2
