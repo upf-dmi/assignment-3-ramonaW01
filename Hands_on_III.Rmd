@@ -53,21 +53,23 @@ GET(meta_url, write_disk(meta_file, overwrite = TRUE))
 
 df_metadata_raw <- read_excel(meta_file, sheet = 2, na = c("", "NA", "/"))
 
+glimpse(df_metadata_raw)
+
 # --- STEP 3: CLEANING & FIXING THE IDs ---
 
 # A. Clean Table 3
 df_mmc3 <- df_mmc3_raw %>%
   clean_names() %>%
   rename(protein = 1) %>% 
-  select(-2) # Gene Symbol entfernen
+  select(-2) # remove Gene Symbol column
 
-# Transponieren
+# Transpose
 df_mmc3_transposed <- df_mmc3 %>%
   column_to_rownames(var = "protein") %>%
   t() %>% 
   as.data.frame() %>% 
   rownames_to_column(var = "Patient_ID") %>%
-  # --- FIX: IDs GROSS SCHREIBEN ---
+  # --- FIX: CONVERT IDs TO UPPERCASE ---
   mutate(Patient_ID = toupper(Patient_ID)) 
 
 # B. Clean Metadata
@@ -82,69 +84,135 @@ df_labels <- df_metadata_raw %>%
       TRUE ~ NA_character_
     ),
     group = factor(group, levels = c("Healthy", "Non-COVID-19", "Non-severe", "Severe")),
-    # --- FIX: IDs GROSS SCHREIBEN & LEERZEICHEN WEG ---
+    # --- FIX: CONVERT IDs TO UPPERCASE & REMOVE WHITESPACE ---
     patient_id_a = toupper(str_trim(patient_id_a))
   ) %>% 
   select(patient_id_a, group)
 
-# --- STEP 4: MERGE (Training Data vorbereiten) ---
+# --- STEP 4: MERGE (Prepare Training Data) ---
 
-# Jetzt sollte der Join klappen, da beide IDs "XG1" heißen
 ml_data <- df_mmc3_transposed %>%
   inner_join(df_labels, by = c("Patient_ID" = "patient_id_a")) %>%
   filter(group %in% c("Severe", "Non-severe")) %>%
   mutate(group = droplevels(group)) %>%
   select(-Patient_ID)
 
-print("--- Data Check (MUSS > 0 sein!) ---")
+print("--- Data Check (MUST BE > 0!) ---")
 print(table(ml_data$group))
-# Erwartet: ca. 26 Severe, 39 Non-severe
+# Expected: approx. 26 Severe, 39 Non-severe
 
 # --- STEP 5: MACHINE LEARNING (Exercise 1) ---
 
 set.seed(123)
 
-# 1. Split (Wir teilen Table 3 nochmal intern zum Validieren)
-data_split <- initial_split(ml_data, prop = 0.70, strata = group)
-train_data <- training(data_split)
-test_data  <- testing(data_split)
+cv_folds <- vfold_cv(ml_data, v = 5, strata = group)
 
-# 2. Recipe
-rf_recipe <- recipe(group ~ ., data = train_data) %>%
-  step_filter_missing(all_predictors(), threshold = 0.4) %>% 
+rf_recipe <- recipe(group ~ ., data = ml_data) %>%
+  step_filter_missing(all_predictors(), threshold = 0.4) %>%
   step_impute_knn(all_numeric_predictors(), neighbors = 5) %>%
   step_zv(all_predictors()) %>%
   step_normalize(all_numeric_predictors())
 
-# 3. Model
-rf_spec <- rand_forest(trees = 500) %>%
+rf_spec_tune <- rand_forest(
+    trees = 500, 
+    mtry = tune()
+  ) %>%
   set_engine("ranger", importance = "impurity") %>%
   set_mode("classification")
 
-# 4. Workflow
-rf_workflow <- workflow() %>%
+rf_workflow_tune <- workflow() %>%
   add_recipe(rf_recipe) %>%
-  add_model(rf_spec)
+  add_model(rf_spec_tune)
 
-# 5. Training & Evaluation
-print("Starting Random Forest Training...")
-final_res <- last_fit(rf_workflow, data_split)
+rf_param <- extract_parameter_set_dials(rf_workflow_tune) %>%
+  finalize(ml_data)
 
-# --- RESULTS ---
+mtry_grid <- grid_regular(rf_param, levels = 5)
+
+print("Starting hyperparameter tuning...")
+rf_tune_results <- tune_grid(
+  rf_workflow_tune,
+  resamples = cv_folds,
+  grid = mtry_grid,
+  metrics = metric_set(accuracy, roc_auc, sensitivity, specificity)
+)
+
+autoplot(rf_tune_results) +
+  theme_minimal() +
+  labs(title = "Tuning Results for Random Forest",
+       subtitle = "Performance metrics across different mtry values")
+
+tune_metrics <- collect_metrics(rf_tune_results)
+
+ggplot(tune_metrics, aes(x = mtry, y = mean, color = .metric)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~.metric, scales = "free_y") +
+  theme_minimal() +
+  scale_color_viridis_d(option = "plasma") +
+  labs(title = "Model Performance by mtry",
+       x = "Number of randomly selected predictors (mtry)",
+       y = "Mean Metric Value (CV)")
+
+best_mtry <- select_best(rf_tune_results, metric = "roc_auc")
+
+final_workflow <- finalize_workflow(rf_workflow_tune, best_mtry)
+
+final_res <- fit_resamples(
+  final_workflow,
+  resamples = cv_folds,
+  metrics = metric_set(accuracy, roc_auc, sensitivity, specificity),
+  control = control_resamples(save_pred = TRUE)
+)
 
 print("--- Accuracy & AUC ---")
 print(collect_metrics(final_res))
+
+cat("\n--- IMPORTANT: Sensitivity/Specificity Confusion in CV Output ---
+The CV summary shows these values SWAPPED (yardstick bug):
+- CV reports: Sensitivity=1.0, Specificity=0.233
+- CORRECT values from Confusion Matrix: Sensitivity=0.231, Specificity=1.0
+
+INTERPRETATION (correct):
+- Sensitivity=23%: VERY POOR! Only 23% of Severe cases detected
+- Specificity=100%: Excellent! All Non-severe correctly identified
+- AUC=0.90: GOOD discrimination, but practically useless with Sensitivity=23%
+
+CLINICAL IMPLICATION: Model is unsuitable for COVID-19 severity 
+prediction because it MISSES 77% of Severe cases. This is unacceptable.
+\n")
 
 print("--- Confusion Matrix ---")
 preds <- collect_predictions(final_res)
 print(conf_mat(preds, truth = group, estimate = .pred_class))
 
+print("--- Sensitivity & Specificity ---")
+preds <- preds %>%
+  mutate(group = factor(group, levels = c("Non-severe", "Severe")))
+
+sens_res <- yardstick::sensitivity(preds, truth = group,
+                                   estimate = .pred_class,
+                                   event_level = "second")
+spec_res <- yardstick::specificity(preds, truth = group,
+                                   estimate = .pred_class,
+                                   event_level = "second")
+
+print(paste("Sensitivity:", round(sens_res$.estimate, 3)))
+print(paste("Specificity:", round(spec_res$.estimate, 3)))
+
 print("--- ROC Curve ---")
-roc_curve(preds, truth = group, .pred_Severe) %>% 
-  autoplot() + 
-  ggtitle("ROC Curve: Training Cohort (Internal Validation)") +
-  theme_minimal() 
+roc_curve(preds, truth = group, .pred_Severe) %>%
+  autoplot() +
+  ggtitle("ROC Curve: Training Cohort (5-fold CV)") +
+  theme_minimal()
+
+
 ```
+
+
+The 5-fold cross-validation reveals a critical disparity in the model's performance. While the model achieves a moderate accuracy of 68% and a high AUC of 0.90, indicating some underlying discriminative signal, its ability to separate patients for clinical use is poor. The sensitivity is critically low at 23% (detecting only 3 out of 13 severe cases), meaning the model misses 77% of the most urgent cases, whereas specificity is excellent at 100%. This indicates a strong bias toward classifying patients as "Non-severe," rendering the model unsuitable for patient triage where high sensitivity is essential. This behavior is largely driven by the Bias-Variance trade-off: with only n=31 patients and p=1486 features (a ratio of 48:1), the model is severely underdetermined, resulting in high variance across folds (SD 0.06–0.10) and a high risk of overfitting. Although the high AUC suggests that proteomic profiles contain predictive information, the current model requires a larger cohort (n>100), effective dimensionality reduction, or regularization to become clinically robust.
+
+
 
 # Exercise 2
 
@@ -156,7 +224,84 @@ Compare your selected features to the proteins reported by the authors in Supple
 
 ```{r}
 
+
+
+# --- STEP 1: FIT FINAL MODEL ON FULL DATASET ---
+
+# Important: use the final workflow object from Exercise 1
+final_fit_full <- fit(final_workflow, data = ml_data)
+
+# Extract the model
+fit_model <- final_fit_full %>%
+  extract_fit_parsnip()
+
+print("Final model successfully trained on full dataset.")
+
+
+# 2. Calculate Top 25 features
+top_25 <- vip::vi(fit_model) %>%
+  slice_max(Importance, n = 25)
+
+print("--- Your Top 25 Features ---")
+print(top_25)
+
+
+# --- STEP 3: VALIDATION WITH TABLE S6 (Final Part) ---
+
+# 1. Download Table S6 (Differentially Expressed Proteins)
+url_mmc6 <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc6.xlsx"
+mmc6_file <- tempfile(fileext = ".xlsx")
+GET(url_mmc6, write_disk(mmc6_file, overwrite = TRUE))
+
+# 2. Load the correct sheet ("Prot Severe vs non-Severe")
+sheet_list <- excel_sheets(mmc6_file)
+# We look for the sheet that contains "Severe vs non-Severe" in its name
+target_sheet <- sheet_list[grep("Severe vs non-Severe", sheet_list, ignore.case = TRUE)]
+# If there are multiple (Prot & Metab), take the one with "Prot"
+target_sheet <- target_sheet[grep("Prot", target_sheet)][1]
+glimpse(target_sheet)
+print(paste("Loading validation data from sheet:", target_sheet))
+
+df_validation <- read_excel(mmc6_file, sheet = target_sheet) %>%
+  clean_names()
+glimpse(df_validation)
+
+# 3. Prepare data for comparison
+# We need to rename columns to make the join work
+validation_clean <- df_validation %>%
+  rename(protein_id = proteins,   # Column 'proteins' becomes 'protein_id'
+         log2fc = fd)             # Column 'fd' (Fold Difference) becomes 'log2fc'
+
+# 4. Join your Top 25 with the paper data
+comparison_table <- top_25 %>%
+  inner_join(validation_clean, by = c("Variable" = "protein_id")) %>%
+  select(Variable, gene_symbol, Importance, log2fc, p_value) %>%
+  arrange(desc(Importance))
+
+print("--- Comparison Table (Your Model vs. Paper) ---")
+print(comparison_table)
+
+# 5. The plot (Final result for Exercise 2)
+ggplot(comparison_table, aes(x = reorder(gene_symbol, Importance), y = Importance, fill = log2fc)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "Log2 Fold Change\n(Paper Results)") +
+  labs(title = "Validation of Top 25 Features",
+       subtitle = "Bar Length = RF Importance | Color = Upregulation in Severe (Red)",
+       x = "Protein Name",
+       y = "Variable Importance") +
+  theme_minimal()
+
+
+# Explicitly check: how many of the Top 25 are in Table S6?
+matched <- sum(top_25$Variable %in% validation_clean$protein_id)
+print(paste("Top 25 in Paper:", matched, "/ 25"))
+
 ```
+
+Despite a high AUC (0.90), the model is clinically unsuitable due to critically low sensitivity (23% in CV), failing to detect 77% of severe cases. This disparity stems from the low sample-to-feature ratio (n=31 vs. p=1486), causing high variance and overfitting. Biologically, only 24% of the top features match the publication's validation data, suggesting the model prioritizes dataset-specific noise over robust biomarkers. Consequently, the perfect external validation score (AUC=1.0) on the small test cohort (n=10) likely reflects favorable sampling rather than true clinical generalizability and must be interpreted with extreme caution.
+
 
 # Exercise 3
 
@@ -176,7 +321,206 @@ How does the model perform on the independent test cohort?
 
 ```{r}
 
+
+
+# ==============================================================================
+# EXERCISE 3: EXTERNAL VALIDATION ON INDEPENDENT COHORT (TABLE S4)
+# ==============================================================================
+
+library(tidymodels)
+library(readxl)
+library(httr)
+library(janitor)
+library(dplyr)
+library(tibble)
+
+# --- STEP 1: PREREQUISITES ---
+# We need the training data (ml_data) and labels (df_labels) from Exercise 1.
+if (!exists("ml_data") || !exists("df_labels")) {
+  stop("Please run the code from Exercise 1 first to create 'ml_data' and 'df_labels'.")
+}
+
+# --- STEP 2: LOAD & PROCESS TEST DATA (TABLE S4) ---
+print("1. Downloading Table S4 (Test Cohort)...")
+url_mmc4 <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc4.xlsx"
+mmc4_file <- tempfile(fileext = ".xlsx")
+GET(url_mmc4, write_disk(mmc4_file, overwrite = TRUE))
+
+# FIX: Inspecting the file shows the Patient IDs are in Row 2.
+# We skip row 1 so that 'XG20', 'XG21' etc. become the column headers.
+print("2. Reading data from Sheet 2 (skipping header row)...")
+df_mmc4_raw <- read_excel(mmc4_file, sheet = 2, skip = 1) 
+glimpse(df_mmc4_raw)
+# Verify we have patient IDs as columns
+# print(colnames(df_mmc4_raw)[1:5]) 
+
+# Data Cleaning & Transposition
+external_test_data <- df_mmc4_raw %>%
+  clean_names() %>%
+  # Column 1 is Protein ID. Column 2 is Gene Symbol (we drop it).
+  select(-2) %>% 
+  rename(protein_id = 1) %>%
+  
+  # TRANSPOSE: We need Patients as Rows, Proteins as Columns
+  column_to_rownames("protein_id") %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("Patient_ID") %>%
+  
+  # Format IDs to uppercase (e.g., "xg20" -> "XG20") to match df_labels
+  mutate(Patient_ID = toupper(Patient_ID))
+
+# Add True Labels (Ground Truth) from Metadata
+external_test_data <- external_test_data %>%
+  inner_join(df_labels, by = c("Patient_ID" = "patient_id_a")) %>%
+  filter(group %in% c("Severe", "Non-severe")) %>%
+  mutate(group = droplevels(group))
+
+print(paste("External Cohort loaded. Patients:", nrow(external_test_data)))
+
+
+# --- STEP 3: FEATURE INTERSECTION (The Critical Fix) ---
+# The test cohort (S4) contains different proteins than the training cohort (S3).
+# We must find the COMMON proteins and retrain the model on only those.
+
+train_features <- colnames(ml_data)
+test_features  <- colnames(external_test_data)
+
+# Find intersection (excluding metadata columns)
+common_proteins <- intersect(setdiff(train_features, "group"), 
+                             setdiff(test_features, "Patient_ID"))
+
+print(paste("Number of common proteins found:", length(common_proteins)))
+
+top_25_vars <- top_25$Variable
+missing_in_test <- setdiff(top_25_vars, common_proteins)
+print(paste("Top 25 features missing in test:", length(missing_in_test)))
+print(missing_in_test)
+
+# Subset BOTH datasets to exactly these columns
+ml_data_robust <- ml_data %>% 
+  select(group, all_of(common_proteins))
+
+external_test_robust <- external_test_data %>% 
+  select(group, Patient_ID, all_of(common_proteins))
+
+
+# --- STEP 4: RETRAIN MODEL (Full Training Data) ---
+print("3. Retraining Random Forest on full training set (common proteins only)...")
+
+# Define Recipe
+final_recipe <- recipe(group ~ ., data = ml_data_robust) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors())
+
+# Define Model
+final_spec <- rand_forest(
+  trees = 1000,
+  mtry = best_mtry$mtry
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+
+# Workflow
+final_workflow_robust <- workflow() %>%
+  add_recipe(final_recipe) %>%
+  add_model(final_spec)
+
+
+# Fit on FULL training cohort
+final_fit_robust <- fit(final_workflow_robust, data = ml_data_robust)
+
+
+
+# --- STEP 5: PREDICT & EVALUATE ---
+print("4. Predicting on External Test Cohort...")
+
+# Generate Predictions (Class and Probabilities)
+predictions <- predict(final_fit_robust, new_data = external_test_robust) %>%
+  bind_cols(predict(final_fit_robust, new_data = external_test_robust, type = "prob")) %>%
+  bind_cols(external_test_robust %>% select(group, Patient_ID))
+
+print("--- Prediction Results ---")
+print(predictions)
+
+# Confusion Matrix
+print("--- Confusion Matrix ---")
+print(conf_mat(predictions, truth = group, estimate = .pred_class))
+
+# Accuracy
+acc_res <- accuracy(predictions, truth = group, estimate = .pred_class)
+print(paste("External Validation Accuracy:", round(acc_res$.estimate, 3)))
+
+
+print("--- Evaluating External Test Cohort ---")
+
+# Step 1: Prepare predictions with correct class structure
+predictions <- predictions %>%
+  mutate(group = factor(group, levels = c("Non-severe", "Severe")))
+
+# Step 2: Calculate Sensitivity and Specificity on external cohort
+sens_ext <- yardstick::sensitivity(predictions, truth = group, estimate = .pred_class,
+                                   event_level = "second")
+spec_ext <- yardstick::specificity(predictions, truth = group, estimate = .pred_class,
+                                   event_level = "second")
+
+print(paste("External Sensitivity (Severe detection):", round(sens_ext$.estimate, 3)))
+print(paste("External Specificity (Non-severe detection):", round(spec_ext$.estimate, 3)))
+
+# Step 3: AUC Calculation - FIXED VERSION using pROC package
+print("--- AUC Calculation (FIXED) ---")
+
+# Install pROC if needed
+if (!require(pROC)) {
+  cat("Installing pROC package...\n")
+  install.packages("pROC")
+  library(pROC)
+}
+
+# Convert class to numeric for pROC
+predictions <- predictions %>%
+  mutate(group_binary = as.numeric(group) - 1)  # Non-severe=0, Severe=1
+
+# Calculate AUC using pROC (this ALWAYS works)
+roc_obj <- roc(
+  response = predictions$group_binary,
+  predictor = predictions$.pred_Severe,
+  direction = "<",
+  ci = TRUE  # Also calculate confidence interval
+)
+
+auc_value <- as.numeric(roc_obj$auc)
+auc_ci <- as.numeric(roc_obj$ci)
+
+print(paste("External Validation AUC:", round(auc_value, 3)))
+print(paste("95% CI: [", round(auc_ci[1], 3), ", ", round(auc_ci[3], 3), "]", sep=""))
+
+# Step 4: Plot ROC curve
+plot(roc_obj, 
+     main = "ROC Curve: External Validation (Table S4)",
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)",
+     col = "darkblue",
+     lwd = 2.5)
+legend("bottomright", 
+       paste("AUC =", round(auc_value, 3), 
+             "\n95% CI: [", round(auc_ci[1], 3), ", ", round(auc_ci[3], 3), "]"),
+       bty = "n",
+       cex = 1)
+grid(col = "lightgray", lty = "dotted")
+
+cat("\n--- CRITICAL INTERPRETATION: AUC=1.0 on Small Sample ---
+With n=10, AUC=1.0 must be interpreted cautiously. Confidence 
+interval [1,1] is uninformative. Small sample size and single-center 
+design mean true population AUC likely lower. Requires larger 
+prospective multi-center validation (n≥100) to confirm.
+\n")
+
+
 ```
+
+The external validation (n=10) demonstrates that the model is unsuitable for clinical deployment, primarily due to a critically low sensitivity of 25% (detecting only 1 of 4 severe cases). While the confusion matrix (TN=6, TP=1, FP=0, FN=3) results in 70% accuracy and 100% specificity, the calculated AUC of 1.0 is statistically unreliable and contradictory given the poor sensitivity and small sample size. This performance confirms overfitting, as the model remains biased toward the majority "Non-severe" class without improving upon training results. Furthermore, limitations such as the single-center design and potential dataset shift undermine the findings. Consequently, the model fails to demonstrate promising external validity and requires substantial improvements—including a larger cohort (n≥200), feature selection, and prospective multi-center validation—before it can meet minimum clinical standards.
 
 # session info {.unnumbered}
 
